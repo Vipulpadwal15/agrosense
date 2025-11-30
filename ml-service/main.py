@@ -1,31 +1,31 @@
-# ml_service/main.py
+# ml-service/main.py
 
 import io
 import numpy as np
 from typing import List
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 
-
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
 import tensorflow as tf
+import json
+
+# ✅ NEW: imports for yield model
+from pathlib import Path
+import pandas as pd
+import joblib
 
 # -----------------------------
 # CONFIG
 # -----------------------------
 IMG_SIZE = 224
 
-# Load model once at startup
+# Load plant disease model once at startup
 MODEL_PATH = "plant_multicrop_model.h5"
 print(f"🔄 Loading model from {MODEL_PATH} ...")
 model = tf.keras.models.load_model(MODEL_PATH)
 print("✅ Model loaded")
-
-# ⚠️ IMPORTANT: paste your class list here from notebook:
-import json
-
-# ...
 
 # Load class names from json file exported during training
 CLASS_NAMES_PATH = "class_names.json"
@@ -34,6 +34,17 @@ with open(CLASS_NAMES_PATH, "r") as f:
 
 NUM_CLASSES = len(CLASS_NAMES)
 print(f"✅ Loaded {NUM_CLASSES} class names from {CLASS_NAMES_PATH}")
+
+# ✅ Load yield model once at startup
+BASE_DIR = Path(__file__).resolve().parent
+YIELD_MODEL_PATH = BASE_DIR / "models" / "yield_model_india.joblib"
+
+try:
+    yield_model = joblib.load(YIELD_MODEL_PATH)
+    print(f"🌾 Yield model loaded from {YIELD_MODEL_PATH}")
+except Exception as e:
+    print(f"⚠️ Yield model NOT LOADED: {e}")
+    yield_model = None
 
 # Disease knowledge base
 # -----------------------------
@@ -128,12 +139,25 @@ class PredictionResponse(BaseModel):
     top3: list[TopPrediction]
     advice: Advice
 
+# ✅ Yield prediction request/response models
+class YieldRequest(BaseModel):
+    Area: float
+    Annual_Rainfall: float
+    Fertilizer: float
+    Pesticide: float
+    Crop: str
+    Season: str
+    State: str
+
+class YieldResponse(BaseModel):
+    predicted_yield: float
+    unit: str = "Yield (same unit as dataset)"  # e.g. Qu/Ha, etc.
 
 # -----------------------------
 # FastAPI app
 # -----------------------------
 
-app = FastAPI(title="AgroSense Plant Disease API")
+app = FastAPI(title="AgroSense Plant Disease & Yield API")
 
 # Allow React localhost etc.
 app.add_middleware(
@@ -154,6 +178,7 @@ def preprocess_image(file_bytes: bytes) -> np.ndarray:
     arr = np.array(img).astype("float32") / 255.0
     arr = np.expand_dims(arr, axis=0)  # shape (1, 224, 224, 3)
     return arr
+
 def filter_probs_by_crop(probs: np.ndarray, crop_hint: str | None):
     """
     If user selects a crop, zero-out probabilities for other crops.
@@ -210,7 +235,7 @@ def build_top_predictions(probs: np.ndarray, top_k: int = 3):
 
 
 # -----------------------------
-# ENDPOINT
+# PLANT DISEASE ENDPOINT
 # -----------------------------
 
 @app.post("/predict", response_model=PredictionResponse)
@@ -269,7 +294,40 @@ async def predict(
         advice=advice_obj,
     )
 
+# -----------------------------
+# 🌾 CROP YIELD PREDICTION ENDPOINT
+# -----------------------------
+
+@app.post("/predict-yield", response_model=YieldResponse)
+def predict_yield(payload: YieldRequest):
+    if yield_model is None:
+        raise HTTPException(status_code=500, detail="Yield model not loaded")
+
+    # Build a DataFrame with the exact columns used during training
+    df = pd.DataFrame([{
+        "Area": payload.Area,
+        "Annual_Rainfall": payload.Annual_Rainfall,
+        "Fertilizer": payload.Fertilizer,
+        "Pesticide": payload.Pesticide,
+        "Crop": payload.Crop,
+        "Season": payload.Season,
+        "State": payload.State,
+    }])
+
+    try:
+        pred = yield_model.predict(df)[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Prediction Failed → {e}")
+
+    return YieldResponse(
+        predicted_yield=round(float(pred), 2),
+        unit="Yield (same unit as dataset)"
+    )
+
+# -----------------------------
+# ROOT
+# -----------------------------
 
 @app.get("/")
 def root():
-    return {"message": "AgroSense Plant Disease API is running"}
+    return {"message": "AgroSense Plant Disease & Yield API is running"}
