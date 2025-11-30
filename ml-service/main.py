@@ -1,114 +1,275 @@
-from fastapi import FastAPI, UploadFile, File, Form
+# ml_service/main.py
+
+import io
+import numpy as np
+from typing import List
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+
+
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import random
-from datetime import date
+from PIL import Image
+import tensorflow as tf
 
-app = FastAPI()
+# -----------------------------
+# CONFIG
+# -----------------------------
+IMG_SIZE = 224
 
+# Load model once at startup
+MODEL_PATH = "plant_multicrop_model.h5"
+print(f"🔄 Loading model from {MODEL_PATH} ...")
+model = tf.keras.models.load_model(MODEL_PATH)
+print("✅ Model loaded")
+
+# ⚠️ IMPORTANT: paste your class list here from notebook:
+import json
+
+# ...
+
+# Load class names from json file exported during training
+CLASS_NAMES_PATH = "class_names.json"
+with open(CLASS_NAMES_PATH, "r") as f:
+    CLASS_NAMES = json.load(f)
+
+NUM_CLASSES = len(CLASS_NAMES)
+print(f"✅ Loaded {NUM_CLASSES} class names from {CLASS_NAMES_PATH}")
+
+# Disease knowledge base
+# -----------------------------
+
+def split_label(label: str):
+    """
+    'Tomato___Early_blight' -> ('Tomato', 'Early blight')
+    """
+    if "___" in label:
+        crop, disease = label.split("___", 1)
+    else:
+        crop, disease = "Unknown", label
+    disease = disease.replace("_", " ")
+    return crop, disease
+
+# Minimal advisory DB. You can extend this any time.
+DISEASE_INFO = {
+    ("Tomato", "Early blight"): {
+        "severity": "medium",
+        "summary": "Fungal disease that causes brown spots with concentric rings on older leaves.",
+        "steps": [
+            "Remove and destroy heavily infected leaves away from the field.",
+            "Avoid overhead irrigation; water at the base of plants in morning.",
+            "Spray a recommended fungicide (e.g., mancozeb or chlorothalonil) as per local agri officer’s advice.",
+            "Maintain good crop spacing and avoid continuous tomato cropping in same field."
+        ],
+        "yield_impact": "If untreated, can reduce tomato yield by 20–40% depending on stage of infection."
+    },
+    ("Tomato", "Late blight"): {
+        "severity": "high",
+        "summary": "Severe disease that spreads fast in cool, wet conditions, affecting leaves and fruits.",
+        "steps": [
+            "Immediately remove severely infected plants to slow spread.",
+            "Do not leave infected plant debris in the field; bury or burn as per local guidelines.",
+            "Use a systemic-contact fungicide combination recommended by local extension service.",
+            "Avoid irrigating late in the day; keep foliage as dry as possible."
+        ],
+        "yield_impact": "Can cause near total crop loss if conditions remain favourable and no control is taken."
+    },
+    ("Potato", "Late blight"): {
+        "severity": "high",
+        "summary": "Serious foliar and tuber disease of potato; thrives in cool, humid conditions.",
+        "steps": [
+            "Destroy infected foliage; do not use infected tubers for seed.",
+            "Use recommended protectant and systemic fungicides in rotation.",
+            "Ensure proper field drainage to reduce humidity around plants."
+        ],
+        "yield_impact": "Severe epidemics may cause 50–100% yield loss if unmanaged."
+    },
+    ("Wheat", "rust"): {
+        "severity": "medium",
+        "summary": "Rust disease causes orange or brown pustules on leaves and stems.",
+        "steps": [
+            "Use resistant varieties in future seasons.",
+            "Consult local agri officer for recommended fungicide spray at early infection.",
+            "Avoid very late sowing which favours rust development."
+        ],
+        "yield_impact": "Can significantly reduce grain weight and yield if not controlled early."
+    },
+}
+
+DEFAULT_ADVICE = {
+    "severity": "unknown",
+    "summary": "Detailed advisory for this specific disease is not configured yet.",
+    "steps": [
+        "Take clear photos of affected plants and consult a local agriculture officer.",
+        "Remove heavily infected plant parts and dispose them away from the field.",
+        "Avoid excessive overhead irrigation and maintain proper spacing.",
+        "Use disease-free seed/seedlings and follow crop rotation."
+    ],
+    "yield_impact": "Yield impact depends on crop stage and disease severity. Early detection and management can greatly reduce losses."
+}
+
+# -----------------------------
+# API models
+# -----------------------------
+
+class TopPrediction(BaseModel):
+    label: str
+    crop: str
+    disease: str
+    confidence: float
+    severity: str
+
+class Advice(BaseModel):
+    summary: str
+    steps: list[str]
+    yield_impact: str
+
+class PredictionResponse(BaseModel):
+    primary_prediction: TopPrediction
+    top3: list[TopPrediction]
+    advice: Advice
+
+
+# -----------------------------
+# FastAPI app
+# -----------------------------
+
+app = FastAPI(title="AgroSense Plant Disease API")
+
+# Allow React localhost etc.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],    # you can restrict later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -----------------------------
+# Helper: preprocess image
+# -----------------------------
 
-class YieldInput(BaseModel):
-    cropType: str
-    soilType: str
-    areaAcres: float
-    sowingDate: str
-    irrigation: str
+def preprocess_image(file_bytes: bytes) -> np.ndarray:
+    img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+    img = img.resize((IMG_SIZE, IMG_SIZE))
+    arr = np.array(img).astype("float32") / 255.0
+    arr = np.expand_dims(arr, axis=0)  # shape (1, 224, 224, 3)
+    return arr
+def filter_probs_by_crop(probs: np.ndarray, crop_hint: str | None):
+    """
+    If user selects a crop, zero-out probabilities for other crops.
+    """
+    if not crop_hint or crop_hint.lower() == "auto":
+        return probs  # no filtering
 
+    crop_hint_lower = crop_hint.lower()
+    mask = np.zeros_like(probs)
 
-@app.post("/ml/disease")
-async def detect_disease(file: UploadFile = File(...), crop_type: str = Form(...)):
-    # NOTE: Stub logic – replace with real CNN model later
-    # For now, return fake but structured response
-    sample_diseases = {
-      "Tomato": ["Early Blight", "Late Blight", "Septoria Leaf Spot"],
-      "Potato": ["Late Blight", "Black Scurf"],
-      "Wheat": ["Leaf Rust", "Yellow Rust"],
-      "Rice": ["Blast", "Brown Spot"],
-      "Cotton": ["Leaf Curl", "Bacterial Blight"],
-      "Soybean": ["Rust", "Downy Mildew"],
-    }
+    for idx, label in enumerate(CLASS_NAMES):
+        crop, _ = split_label(label)
+        if crop.lower().startswith(crop_hint_lower):
+            mask[idx] = 1.0
 
-    diseases = sample_diseases.get(crop_type, ["Unknown Disease"])
-    primary = random.choice(diseases)
-    secondary = random.choice(diseases)
+    if mask.sum() == 0:
+        # no matching classes found -> return original
+        return probs
 
-    confidence = round(random.uniform(0.75, 0.95), 2)
-    severity = random.choice(["low", "moderate", "high"])
+    filtered = probs * mask
+    total = filtered.sum()
+    if total <= 0:
+        return probs
 
-    advice_steps = [
-        "Remove heavily infected leaves and destroy them away from the field.",
-        "Avoid overhead irrigation to reduce leaf wetness.",
-        "Use recommended fungicide as per local agricultural office advice.",
-    ]
-
-    if severity == "high":
-        advice_steps.append("Consider consulting local agronomist immediately.")
-
-    return {
-        "crop": crop_type,
-        "primary_prediction": {
-            "disease": primary,
-            "confidence": confidence,
-            "severity": severity,
-        },
-        "secondary_prediction": {
-            "disease": secondary,
-            "confidence": round(confidence - 0.1, 2),
-        },
-        "advice": {
-            "steps": advice_steps,
-            "yield_impact": "If untreated, this may reduce yield by 15–40%. Early action can significantly reduce losses.",
-        },
-    }
+    return filtered / total
 
 
-@app.post("/ml/yield")
-async def predict_yield(data: YieldInput):
-    # Stub logic – replace with real ML model later
-    base_yield = {
-        "Wheat": 20,
-        "Rice": 25,
-        "Cotton": 10,
-        "Soybean": 12,
-        "Tomato": 30,
-    }.get(data.cropType, 15)
+def build_top_predictions(probs: np.ndarray, top_k: int = 3):
+    idxs = np.argsort(probs)[::-1]
+    top_preds: list[TopPrediction] = []
 
-    soil_factor = {
-        "Black": 1.1,
-        "Red": 1.0,
-        "Sandy": 0.9,
-        "Loamy": 1.15,
-    }.get(data.soilType, 1.0)
+    for idx in idxs:
+        if idx >= len(CLASS_NAMES):
+            continue
 
-    irrigation_factor = {
-        "Rainfed": 0.9,
-        "Canal": 1.05,
-        "Borewell": 1.0,
-        "Drip": 1.1,
-    }.get(data.irrigation, 1.0)
+        label = CLASS_NAMES[idx]
+        crop, disease = split_label(label)
+        info = DISEASE_INFO.get((crop, disease), DEFAULT_ADVICE)
 
-    expected = base_yield * soil_factor * irrigation_factor
-    min_yield = round(expected * 0.85, 1)
-    max_yield = round(expected * 1.15, 1)
-    expected_per_acre = round(expected, 1)
+        top_preds.append(
+            TopPrediction(
+                label=label,
+                crop=crop,
+                disease=disease,
+                confidence=float(probs[idx]),
+                severity=info["severity"],
+            )
+        )
 
-    notes = [
-        "Timely weeding and pest control will help you reach the higher end of this range.",
-        "Monitor local rainfall; one extra irrigation at flowering can improve yield.",
-    ]
+        if len(top_preds) == top_k:
+            break
 
-    return {
-        "expected_yield_per_acre": expected_per_acre,
-        "min_yield": min_yield,
-        "max_yield": max_yield,
-        "confidence": "medium",
-        "notes": notes,
-    }
+    return top_preds
+
+
+# -----------------------------
+# ENDPOINT
+# -----------------------------
+
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(
+    image: UploadFile = File(...),
+    crop_hint: str | None = Form(None)
+):
+    if not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file")
+
+    bytes_data = await image.read()
+
+    try:
+        input_tensor = preprocess_image(bytes_data)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not process image: {e}")
+
+    raw_preds = model.predict(input_tensor)
+    probs = raw_preds[0]
+
+    # 🔹 1) use crop hint to filter
+    probs = filter_probs_by_crop(probs, crop_hint)
+
+    # 🔹 2) build top-3 predictions
+    top3 = build_top_predictions(probs, top_k=3)
+    if not top3:
+        raise HTTPException(status_code=500, detail="Model could not produce any predictions")
+
+    primary = top3[0]
+
+    # 🔹 3) low-confidence handling
+    max_conf = primary.confidence
+    LOW_CONF_THRESHOLD = 0.45  # tweak as you like
+
+    if max_conf < LOW_CONF_THRESHOLD:
+        # treat as uncertain – still return top3, but advisory says "not sure"
+        info = DEFAULT_ADVICE.copy()
+        info["summary"] = (
+            "The model is not very confident about this result. "
+            "Please try taking a clearer photo and also consult a local agriculture expert."
+        )
+        severity = "unknown"
+        primary.severity = severity
+    else:
+        info = DISEASE_INFO.get((primary.crop, primary.disease), DEFAULT_ADVICE)
+
+    advice_obj = Advice(
+        summary=info["summary"],
+        steps=info["steps"],
+        yield_impact=info["yield_impact"],
+    )
+
+    return PredictionResponse(
+        primary_prediction=primary,
+        top3=top3,
+        advice=advice_obj,
+    )
+
+
+@app.get("/")
+def root():
+    return {"message": "AgroSense Plant Disease API is running"}

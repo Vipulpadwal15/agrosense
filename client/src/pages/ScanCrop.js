@@ -1,15 +1,31 @@
 // src/pages/ScanCrop.js
 import React, { useState } from "react";
-import { api } from "../api";
 import { Navigate } from "react-router-dom";
+
+const SUPPORTED_CROPS = [
+  "Apple",
+  "Blueberry",
+  "Cherry",
+  "Corn",
+  "Grape",
+  "Orange",
+  "Peach",
+  "Pepper (bell)",
+  "Potato",
+  "Raspberry",
+  "Soybean",
+  "Squash",
+  "Strawberry",
+  "Tomato",
+];
 
 function ScanCrop() {
   const [image, setImage] = useState(null);
-  const [cropType, setCropType] = useState("Tomato");
-  const [result, setResult] = useState(null);
   const [previewUrl, setPreviewUrl] = useState("");
+  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [selectedCrop, setSelectedCrop] = useState("auto"); // NEW
 
   const token = localStorage.getItem("token");
   if (!token) return <Navigate to="/login" />;
@@ -19,11 +35,8 @@ function ScanCrop() {
     setImage(file);
     setError("");
     setResult(null);
-    if (file) {
-      setPreviewUrl(URL.createObjectURL(file));
-    } else {
-      setPreviewUrl("");
-    }
+    if (file) setPreviewUrl(URL.createObjectURL(file));
+    else setPreviewUrl("");
   };
 
   const handleSubmit = async (e) => {
@@ -39,16 +52,28 @@ function ScanCrop() {
     try {
       const formData = new FormData();
       formData.append("image", image);
-      formData.append("cropType", cropType);
 
-      const res = await api.post("/crop/scan", formData, {
-        headers: { "Content-Type": "multipart/form-data" },
+      // send crop hint (backend can ignore or use later)
+      if (selectedCrop !== "auto") {
+        formData.append("crop_hint", selectedCrop);
+      }
+
+      const res = await fetch("http://localhost:8001/predict", {
+        method: "POST",
+        body: formData,
       });
 
-      setResult(res.data);
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || "Prediction failed");
+      }
+
+      const data = await res.json();
+      console.log("ML result:", data);
+      setResult(data);
     } catch (err) {
       console.error("Scan error:", err);
-      setError(err.response?.data?.message || "Could not analyze this image.");
+      setError(err.message || "Could not analyze this image.");
     } finally {
       setLoading(false);
     }
@@ -56,35 +81,51 @@ function ScanCrop() {
 
   const primary = result?.primary_prediction;
 
+  const severityBadgeClass = (severity) => {
+    if (!severity) return "badge badge-amber";
+    const s = severity.toLowerCase();
+    if (s === "high") return "badge badge-red";
+    if (s === "medium") return "badge badge-amber";
+    if (s === "low" || s === "mild") return "badge badge-green";
+    return "badge badge-amber";
+  };
+
   return (
     <div className="page">
       <div className="page-header">
         <div>
           <h1 className="page-title">Scan crop</h1>
           <p className="page-subtitle">
-            A two–step flow to check leaf health and get simple actions.
+            Upload a leaf image and let AgroSense analyze disease risk and give
+            simple actions.
           </p>
         </div>
       </div>
 
       <div className="layout-two">
-        {/* Left: form */}
+        {/* LEFT: form */}
         <form className="panel" onSubmit={handleSubmit}>
-          <p className="panel-label">1 · Select crop & image</p>
+          <p className="panel-label">1 · Upload leaf image</p>
 
+          {/* NEW: crop selector */}
           <label className="field">
-            <span>Crop</span>
+            <span>Crop (optional)</span>
             <select
-              value={cropType}
-              onChange={(e) => setCropType(e.target.value)}
+              className="input"
+              value={selectedCrop}
+              onChange={(e) => setSelectedCrop(e.target.value)}
             >
-              <option>Tomato</option>
-              <option>Potato</option>
-              <option>Wheat</option>
-              <option>Rice</option>
-              <option>Cotton</option>
-              <option>Soybean</option>
+              <option value="auto">Auto detect (recommended)</option>
+              {SUPPORTED_CROPS.map((crop) => (
+                <option key={crop} value={crop}>
+                  {crop}
+                </option>
+              ))}
             </select>
+            <p className="field-helper">
+              Model currently supports:{" "}
+              <strong>{SUPPORTED_CROPS.join(", ")}</strong>
+            </p>
           </label>
 
           <label className="field">
@@ -110,53 +151,68 @@ function ScanCrop() {
 
           {error && <p className="field-error">{error}</p>}
 
-          <button className="btn primary full-width" type="submit" disabled={loading}>
+          <button
+            className="btn primary full-width"
+            type="submit"
+            disabled={loading}
+          >
             {loading ? "Analyzing…" : "Run scan"}
           </button>
         </form>
 
-        {/* Right: result */}
+        {/* RIGHT: result */}
         <div className="panel">
-          <p className="panel-label">2 · Result</p>
+          <p className="panel-label">2 · Result & advisory</p>
+
           {!result && (
             <p className="panel-caption">
-              Once you upload an image and run the scan, results will appear
-              here. Try to capture a single leaf in good light.
+              After you upload an image and run the scan, the detected disease,
+              risk level and suggestions will appear here.
             </p>
           )}
 
           {primary && (
             <>
               <div className="result-header">
-                <span className="result-title">{primary.disease}</span>
-                <span
-                  className={
-                    primary.severity === "high"
-                      ? "badge badge-red"
-                      : primary.severity === "medium"
-                      ? "badge badge-amber"
-                      : "badge badge-green"
-                  }
-                >
+                <span className="result-title">
+                  {primary.crop} – {primary.disease}
+                </span>
+                <span className={severityBadgeClass(primary.severity)}>
                   {primary.severity || "unknown"} risk
                 </span>
               </div>
+
               <p className="panel-caption">
                 Confidence:{" "}
-                {Math.round((primary.confidence || 0) * 100)}
-                % · Crop: {cropType}
+                {Math.round((primary.confidence || 0) * 100)}%
               </p>
+
+              {result.top3 && result.top3.length > 0 && (
+                <>
+                  <p className="panel-label mt-md">Model view (top 3)</p>
+                  <ul className="list">
+                    {result.top3.map((p, i) => (
+                      <li key={i}>
+                        {Math.round(p.confidence * 100)}% – {p.crop}{" "}
+                        {p.disease} ({p.severity || "risk"})
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
 
               {result.advice && (
                 <>
-                  <p className="panel-label mt-md">Suggested steps</p>
-                  <ul className="list">
+                  <p className="panel-label mt-md">What you can do</p>
+                  <p className="panel-caption">{result.advice.summary}</p>
+                  <ul className="list mt-sm">
                     {result.advice.steps?.map((s, i) => (
                       <li key={i}>{s}</li>
                     ))}
                   </ul>
                   {result.advice.yield_impact && (
                     <p className="panel-caption mt-sm">
+                      <strong>Yield impact:</strong>{" "}
                       {result.advice.yield_impact}
                     </p>
                   )}
